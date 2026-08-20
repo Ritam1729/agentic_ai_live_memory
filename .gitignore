@@ -1,5 +1,8 @@
 # Virtual environment
 .venv/
+.venv_anaconda/
+venv/
+env/
 
 # Environment variables / API keys
 .env
@@ -17,3 +20,8 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local database
+*.db
+*.sqlite
+*.sqlite3
