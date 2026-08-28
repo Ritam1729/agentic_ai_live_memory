@@ -23,13 +23,18 @@ from langgraph.store.postgres import PostgresStore
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain.tools import tool
 
 from tools import (
     save_memory,
     search_memory,
 )
 from evidence import create_evidence
-import asyncio
+
+from agents import (
+    build_jira_agent,
+    build_notion_agent,
+)
 
 class AgentState(MessagesState):
     evidence: list[dict]
@@ -99,64 +104,114 @@ async def main():
     # --------------------------------------------------
 
     client = MultiServerMCPClient(
-    {
-        "atlassian": {
-            "transport": "http",
-            "url": "https://mcp.atlassian.com/v1/mcp",
-            "headers": jira_auth_header,
-        },
+        {
+            "atlassian": {
+                "transport": "http",
+                "url": "https://mcp.atlassian.com/v1/mcp",
+                "headers": jira_auth_header,
+            },
 
-        "notion": {
-            "transport": "stdio",
-            "command": "npx",
-            "args": [
-                "-y",
-                "mcp-remote",
-                "https://mcp.notion.com/mcp",
-            ],
-        },
-    }
+            "notion": {
+                "transport": "stdio",
+                "command": "npx",
+                "args": [
+                    "-y",
+                    "mcp-remote",
+                    "https://mcp.notion.com/mcp",
+                ],
+            },
+        }
     )
 
-    # Get tools exposed by the MCP server
+    # Get tools exposed by the MCP servers
     mcp_tools = await client.get_tools()
 
+    jira_tools = [
+        tool for tool in mcp_tools
+        if (
+            tool.name.startswith("getJira")
+            or tool.name.startswith("searchJira")
+            or tool.name.startswith("lookupJira")
+        )
+    ]
+
+    notion_tools = [
+        tool for tool in mcp_tools
+        if tool.name.startswith("notion-")
+    ]
+
+    jira_agent = build_jira_agent(
+    jira_tools,
+    JIRA_CLOUD_ID
+    )
+    notion_agent = build_notion_agent(notion_tools)
+
+    @tool
+    async def ask_jira_agent(question: str) -> str:
+        """
+        Ask the Jira specialist to research current Jira information.
+        """
+
+        result = await jira_agent.ainvoke(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": question,
+                    }
+                ]
+            }
+        )
+
+        return result["messages"][-1].content
+
+    @tool
+    async def ask_notion_agent(question: str) -> str:
+        """
+        Ask the Notion specialist to research project documentation.
+        """
+
+        result = await notion_agent.ainvoke(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": question,
+                    }
+                ]
+            }
+        )
+
+        return result["messages"][-1].content
 
     print("\n" + "=" * 60)
     print("MCP TOOLS DISCOVERED")
     print("=" * 60)
 
-    for tool in mcp_tools:
-        print(f"- {tool.name}")
-
+    for mcp_tool in mcp_tools:
+        print(f"- {mcp_tool.name}")
 
     # --------------------------------------------------
-    # 4.2 Local tools
+    # 4.2 Supervisor tools
     # --------------------------------------------------
 
-    local_tools = [
+    supervisor_tools = [
         save_memory,
         search_memory,
+        ask_jira_agent,
+        ask_notion_agent,
     ]
 
-
+    print(
+        f"SUPERVISOR TOOLS AVAILABLE: {len(supervisor_tools)}"
+    )
     # --------------------------------------------------
-    # 4.3 Combine local + MCP tools
-    # --------------------------------------------------
-
-    tools = local_tools + mcp_tools
-
-
-    print("\n" + "=" * 60)
-    print(f"TOTAL TOOLS AVAILABLE: {len(tools)}")
-    print("=" * 60)
-
-
-    # --------------------------------------------------
-    # 4.4 Bind tools to Gemini
+    # 4.4 Bind supervisor tools to Gemini
     # --------------------------------------------------
 
-    model_with_tools = model.bind_tools(tools)
+    model_with_tools = model.bind_tools(
+        supervisor_tools
+    )
 
 
     # ==================================================
@@ -169,94 +224,64 @@ async def main():
             [
                 SystemMessage(
                     content=(
-                        "You are an AI project management assistant with access to "
-                        "live Jira,and Notion data, persistent conversation state, "
-                        "and persistent long-term memory.\n\n"
+                        "You are the supervisor agent for an AI "
+                        "project-management workspace.\n\n"
 
-                        "RESPONSIBILITIES:\n"
-                        "1. Answer accurately, clearly, and concisely.\n"
-                        "2. Use live external data when the user's question requires "
-                        "current information.\n"
-                        "3. Use long-term memory when information from previous "
-                        "conversations may be relevant.\n"
-                        "4. Save information to long-term memory when the user explicitly "
-                        "asks you to remember it, or when it is a durable preference, "
-                        "project fact, or important decision.\n\n"
+                        "Your job is to understand the user's request, "
+                        "delegate research to the appropriate specialist "
+                        "agents, compare their findings, and produce the "
+                        "final answer.\n\n"
 
-                        "MEMORY RULES:\n"
-                        "- If the user says 'remember this', 'save this', "
-                        "'keep this in mind', or similar, ALWAYS call save_memory "
-                        "before responding.\n"
-                        "- Do not save ordinary, temporary, or irrelevant conversation.\n"
-                        "- Use search_memory when the answer may depend on information "
-                        "from previous conversations.\n"
-                        "- Never claim to remember something unless it was actually "
-                        "retrieved from memory or is present in the current conversation.\n\n"
+                        "SPECIALIST AGENTS:\n"
+                        "- ask_jira_agent: retrieves current Jira "
+                        "information for project AAW.\n"
+                        "- ask_notion_agent: retrieves project "
+                        "documentation and plans from Notion.\n"
+                        "- search_memory: retrieves relevant long-term "
+                        "memory.\n"
+                        "- save_memory: stores durable information when "
+                        "appropriate.\n\n"
 
-                        "JIRA RULES:\n"
-                        "- Use Jira MCP tools for current Jira tasks, issues, statuses, "
-                        "priorities, assignees, and other live Jira information.\n"
-                        "- The primary Jira project is Agentic_AI_Workspace with project "
-                        "key AAW.\n"
-                        "- For questions about this project, ALL Jira searches must "
-                        "include project = AAW in the JQL.\n"
-                        "- Never search unrelated Jira projects unless the user explicitly "
-                        "asks for another project.\n"
-                        "- For current in-progress issues use:\n"
-                        "  project = AAW AND status = \"In Progress\"\n"
-                        "- Prefer live Jira data over memory for current Jira state.\n"
-                        "- Never invent Jira issues or Jira information.\n\n"
+                        "DELEGATION RULES:\n"
+                        "- Use ask_jira_agent for current Jira tasks, "
+                        "issues, statuses, priorities, and operational "
+                        "project state.\n"
+                        "- Use ask_notion_agent for project documentation, "
+                        "plans, architecture, decisions, and documented "
+                        "status.\n"
+                        "- Use search_memory when previous conversations "
+                        "may be relevant.\n"
+                        "- When the user asks for a comparison between "
+                        "Jira and Notion, use BOTH specialist agents.\n\n"
 
-                        "NOTION RULES:\n"
-                        "- Use Notion MCP tools for project documentation, plans, "
-                        "architecture notes, specifications, decisions, and project notes.\n"
-                        "- Use notion-search to find relevant pages.\n"
-                        "- Use notion-fetch to retrieve the contents of relevant pages.\n"
-                        "- Do not invent Notion content.\n\n"
+                        "RECONCILIATION:\n"
+                        "- Compare the findings returned by the specialists.\n"
+                        "- Identify agreements, differences, and conflicts.\n"
+                        "- Do not silently hide conflicting information.\n"
+                        "- Prefer Jira for current operational task status.\n"
+                        "- Prefer Notion for project documentation and plans.\n\n"
 
-                        "SOURCE PRIORITY:\n"
-                        "- Jira is the preferred source for current task status and "
-                        "operational project state.\n"
-                        "- Notion is the preferred source for project documentation, "
-                        "plans, architecture, and documented decisions.\n"
-                        "- If sources disagree, do not silently choose one. Explicitly "
-                        "identify the conflict and show the relevant evidence.\n\n"
+                        "EVIDENCE:\n"
+                        "- Base factual claims on specialist results or "
+                        "retrieved memory.\n"
+                        "- Do not invent facts or sources.\n"
+                        "- Clearly identify which source supports important "
+                        "claims.\n\n"
 
-                        "CROSS-SOURCE REASONING:\n"
-                        "- When the user asks for information across Jira, and Notion"
-                        " query the relevant sources rather than answering from "
-                        "only one source.\n"
-                        "- Compare the retrieved information across sources.\n"
-                        "- Identify agreements, differences, and missing information.\n"
-                        "- Do not assume that similar wording means the sources agree.\n"
-                        "- When information conflicts, report the conflict explicitly.\n\n"
-
-                        "EVIDENCE RULES:\n"
-                        "- Treat external tool results as evidence.\n"
-                        "- Base factual claims about Jira,and Notion on retrieved "
-                        "evidence.\n"
-                        "- Jira evidence should be cited as [Jira: tool_name].\n"
-                        "- Notion evidence should be cited as [Notion: tool_name].\n"
-                        "- Do not invent citations or sources.\n"
-                        "- If the available evidence does not support a claim, say so.\n"
-                        "- When sources disagree, cite the relevant sources separately.\n\n"
-
-                        "TOOL USAGE:\n"
-                        "- Use the minimum number of tools necessary, but use ALL relevant "
-                        "sources when the user explicitly asks for a cross-source comparison.\n"
-                        "- After receiving a tool result, determine whether another tool "
-                        "call is necessary before answering.\n"
-                        "- Do not claim that an external action succeeded unless the "
-                        "corresponding tool returned a successful result."
+                        "Always delegate to the appropriate specialist when "
+                        "external information is needed. Do not guess."
                     )
                 )
-            ]
-            + state["messages"]
+            ] + state["messages"]
         )
 
         return {
             "messages": [response]
         }
+
+    tool_node = ToolNode(
+        supervisor_tools
+    )
 
     def collect_evidence(state: AgentState):
 
@@ -311,11 +336,6 @@ async def main():
             }
         }
 
-    # ==================================================
-    # 6. Tool node
-    # ==================================================
-
-    tool_node = ToolNode(tools)
 
 
     # ==================================================
@@ -335,39 +355,18 @@ async def main():
         tool_node
     )
 
-    builder.add_node(
-        "evidence",
-        collect_evidence
-    )
-    builder.add_node(
-        "reconciliation",
-        reconcile_evidence
-    )
-
     builder.add_edge(
         START,
         "llm"
     )
-
 
     builder.add_conditional_edges(
         "llm",
         tools_condition
     )
 
-
     builder.add_edge(
         "tools",
-        "evidence"
-    )
-
-    builder.add_edge(
-        "evidence",
-        "reconciliation"
-    )
-
-    builder.add_edge(
-        "reconciliation",
         "llm"
     )
 
@@ -429,12 +428,10 @@ async def main():
                     "messages": [
                         {
                             "role": "user",
-                            "content": (
-                                                "Find all currently in-progress tasks and issues related to "
-                                                "my Agentic AI Workspace. Check Jira,and the relevant Notion page"
-                                                ". Combine the information, identify which "
-                                                "items appear across multiple sources, and clearly identify "
-                                                "any differences or conflicts."
+                            "content": (  
+                                        "Compare the current in-progress tasks in Jira with the "
+                                        "tasks documented in my Agentic AI Workspace Notion page. "
+                                        "Identify agreements and differences."
                                         ),
                         }
                     ],
