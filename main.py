@@ -28,10 +28,12 @@ from tools import (
     save_memory,
     search_memory,
 )
-
+from evidence import create_evidence
 import asyncio
+
 class AgentState(MessagesState):
     evidence: list[dict]
+    reconciliation: dict
 
 if hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
     asyncio.set_event_loop_policy(
@@ -81,7 +83,7 @@ jira_auth_header = {
 # ==================================================
 
 model = ChatGoogleGenerativeAI(
-    model="gemini-3.6-flash",
+    model="gemini-3.1-flash-lite",
     temperature=0,
 )
 
@@ -97,13 +99,23 @@ async def main():
     # --------------------------------------------------
 
     client = MultiServerMCPClient(
-        {
-            "atlassian": {
-                "transport": "http",
-                "url": "https://mcp.atlassian.com/v1/mcp",
-                "headers": jira_auth_header,
-            }
-        }
+    {
+        "atlassian": {
+            "transport": "http",
+            "url": "https://mcp.atlassian.com/v1/mcp",
+            "headers": jira_auth_header,
+        },
+
+        "notion": {
+            "transport": "stdio",
+            "command": "npx",
+            "args": [
+                "-y",
+                "mcp-remote",
+                "https://mcp.notion.com/mcp",
+            ],
+        },
+    }
     )
 
     # Get tools exposed by the MCP server
@@ -157,67 +169,85 @@ async def main():
             [
                 SystemMessage(
                     content=(
-                        "You are an AI project management assistant "
-                        "with access to live Atlassian data and persistent "
-                        "long-term memory.\n\n"
+                        "You are an AI project management assistant with access to "
+                        "live Jira,and Notion data, persistent conversation state, "
+                        "and persistent long-term memory.\n\n"
 
                         "RESPONSIBILITIES:\n"
-                        "1. Answer accurately and concisely.\n"
-                        "2. Use Atlassian MCP tools whenever the user asks "
-                        "about current Jira projects, issues, tasks, "
-                        "statuses, priorities, assignees, or other live "
-                        "Atlassian information.\n"
-                        "3. Use search_memory when information from a "
-                        "previous conversation may be relevant.\n"
-                        "4. Use save_memory when the user explicitly asks "
-                        "you to remember something for future conversations "
-                        "or when information is clearly durable and useful.\n\n"
+                        "1. Answer accurately, clearly, and concisely.\n"
+                        "2. Use live external data when the user's question requires "
+                        "current information.\n"
+                        "3. Use long-term memory when information from previous "
+                        "conversations may be relevant.\n"
+                        "4. Save information to long-term memory when the user explicitly "
+                        "asks you to remember it, or when it is a durable preference, "
+                        "project fact, or important decision.\n\n"
 
                         "MEMORY RULES:\n"
                         "- If the user says 'remember this', 'save this', "
-                        "'keep this in mind', or similar, ALWAYS call "
-                        "save_memory before responding.\n"
-                        "- Do not save ordinary or temporary conversation.\n"
-                        "- Before answering a question that may depend on "
-                        "previously remembered information, use search_memory.\n"
-                        "- Never claim to remember information unless it was "
-                        "actually retrieved from memory or exists in the "
-                        "current conversation.\n\n"
+                        "'keep this in mind', or similar, ALWAYS call save_memory "
+                        "before responding.\n"
+                        "- Do not save ordinary, temporary, or irrelevant conversation.\n"
+                        "- Use search_memory when the answer may depend on information "
+                        "from previous conversations.\n"
+                        "- Never claim to remember something unless it was actually "
+                        "retrieved from memory or is present in the current conversation.\n\n"
 
                         "JIRA RULES:\n"
-                            "- Use Atlassian MCP tools for questions about current Jira "
-                            "tasks and project status.\n"
-                            "- Prefer live Jira information over memory for current Jira state.\n"
-                            "- Do not invent Jira issues, statuses, priorities, or other "
-                            "project information.\n\n"
+                        "- Use Jira MCP tools for current Jira tasks, issues, statuses, "
+                        "priorities, assignees, and other live Jira information.\n"
+                        "- The primary Jira project is Agentic_AI_Workspace with project "
+                        "key AAW.\n"
+                        "- For questions about this project, ALL Jira searches must "
+                        "include project = AAW in the JQL.\n"
+                        "- Never search unrelated Jira projects unless the user explicitly "
+                        "asks for another project.\n"
+                        "- For current in-progress issues use:\n"
+                        "  project = AAW AND status = \"In Progress\"\n"
+                        "- Prefer live Jira data over memory for current Jira state.\n"
+                        "- Never invent Jira issues or Jira information.\n\n"
 
-                            "JIRA RULES:\n"
-                            "- You have access to the Jira project Agentic_AI_Workspace.\n"
-                            "- The Jira project key is AAW.\n"
-                            "- For ALL Jira searches, restrict the JQL to project = AAW "
-                            "unless the user explicitly asks about another project.\n"
-                            "- Never search all Jira projects when answering questions "
-                            "about this project.\n"
-                            "- For example, for in-progress issues use:\n"
-                            "  project = AAW AND status = \"In Progress\"\n"
-                            "- For high-priority incomplete issues use:\n"
-                            "  project = AAW AND priority = High AND status != Done\n"
-                            "- Use searchJiraIssuesUsingJql for Jira searches.\n"
-                            "- Do not invent Jira issues or project information.\n\n"
+                        "NOTION RULES:\n"
+                        "- Use Notion MCP tools for project documentation, plans, "
+                        "architecture notes, specifications, decisions, and project notes.\n"
+                        "- Use notion-search to find relevant pages.\n"
+                        "- Use notion-fetch to retrieve the contents of relevant pages.\n"
+                        "- Do not invent Notion content.\n\n"
 
-                            "JIRA CONTEXT:\n"
-                            f"- Jira site: {os.getenv('JIRA_URL')}\n"
-                            f"- Jira cloudId: {JIRA_CLOUD_ID}\n"
-                            f"- Jira project key: AAW\n"
-                            "EVIDENCE RULES:\n"
-                            "- Treat tool results as evidence.\n"
-                            "- When answering questions using external data, base factual "
-                            "claims on the available evidence.\n"
-                            "- Cite important external claims using the evidence source "
-                            "and source ID.\n"
-                            "- Use citations in this format: [MCP: tool_name]\n"
-                            "- Do not invent citations or sources.\n"
-                            "- If the available evidence does not support a claim, say so.\n\n"
+                        "SOURCE PRIORITY:\n"
+                        "- Jira is the preferred source for current task status and "
+                        "operational project state.\n"
+                        "- Notion is the preferred source for project documentation, "
+                        "plans, architecture, and documented decisions.\n"
+                        "- If sources disagree, do not silently choose one. Explicitly "
+                        "identify the conflict and show the relevant evidence.\n\n"
+
+                        "CROSS-SOURCE REASONING:\n"
+                        "- When the user asks for information across Jira, and Notion"
+                        " query the relevant sources rather than answering from "
+                        "only one source.\n"
+                        "- Compare the retrieved information across sources.\n"
+                        "- Identify agreements, differences, and missing information.\n"
+                        "- Do not assume that similar wording means the sources agree.\n"
+                        "- When information conflicts, report the conflict explicitly.\n\n"
+
+                        "EVIDENCE RULES:\n"
+                        "- Treat external tool results as evidence.\n"
+                        "- Base factual claims about Jira,and Notion on retrieved "
+                        "evidence.\n"
+                        "- Jira evidence should be cited as [Jira: tool_name].\n"
+                        "- Notion evidence should be cited as [Notion: tool_name].\n"
+                        "- Do not invent citations or sources.\n"
+                        "- If the available evidence does not support a claim, say so.\n"
+                        "- When sources disagree, cite the relevant sources separately.\n\n"
+
+                        "TOOL USAGE:\n"
+                        "- Use the minimum number of tools necessary, but use ALL relevant "
+                        "sources when the user explicitly asks for a cross-source comparison.\n"
+                        "- After receiving a tool result, determine whether another tool "
+                        "call is necessary before answering.\n"
+                        "- Do not claim that an external action succeeded unless the "
+                        "corresponding tool returned a successful result."
                     )
                 )
             ]
@@ -256,6 +286,30 @@ async def main():
             "evidence": evidence_items
         }
 
+    def reconcile_evidence(state: AgentState):
+
+        evidence = state.get("evidence", [])
+
+        if not evidence:
+            return {
+                "reconciliation": {
+                    "agreements": [],
+                    "conflicts": [],
+                    "unresolved": []
+                }
+            }
+
+        # For now, let the LLM perform the semantic comparison
+        # using the collected evidence.
+        return {
+            "reconciliation": {
+                "evidence_count": len(evidence),
+                "sources": list({
+                    item["source"]
+                    for item in evidence
+                })
+            }
+        }
 
     # ==================================================
     # 6. Tool node
@@ -285,6 +339,11 @@ async def main():
         "evidence",
         collect_evidence
     )
+    builder.add_node(
+        "reconciliation",
+        reconcile_evidence
+    )
+
     builder.add_edge(
         START,
         "llm"
@@ -304,6 +363,11 @@ async def main():
 
     builder.add_edge(
         "evidence",
+        "reconciliation"
+    )
+
+    builder.add_edge(
+        "reconciliation",
         "llm"
     )
 
@@ -366,9 +430,12 @@ async def main():
                         {
                             "role": "user",
                             "content": (
-                                "What Jira issues are currently "
-                                "in progress?"
-                            ),
+                                                "Find all currently in-progress tasks and issues related to "
+                                                "my Agentic AI Workspace. Check Jira,and the relevant Notion page"
+                                                ". Combine the information, identify which "
+                                                "items appear across multiple sources, and clearly identify "
+                                                "any differences or conflicts."
+                                        ),
                         }
                     ],
                     "evidence": [],
